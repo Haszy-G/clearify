@@ -1,0 +1,9 @@
+# generated build output (regenerate via: npm run build)
+distributions/
+
+# local experiments and assets that are not part of the product
+untitled*
+*.pen
+screenshot-*.png
+/docs/cold-outbound-guide.*
+/receiving-international-*

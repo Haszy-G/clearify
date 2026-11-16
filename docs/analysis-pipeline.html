@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clearify — Analysis Pipeline</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 16mm 16mm;
+    @bottom-center { content: "Clearify — Analysis Pipeline · page " counter(page) " of " counter(pages); font-size: 8pt; color: #888; font-family: sans-serif; }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt; color: #1c2422; line-height: 1.45; margin: 0; }
+  h1 { font-size: 19pt; margin: 0 0 2mm 0; color: #0F6B44; letter-spacing: -0.3pt; }
+  h2 { font-size: 12.5pt; margin: 7mm 0 2mm 0; color: #0F6B44; border-bottom: 1.5pt solid #0F6B44; padding-bottom: 1mm; page-break-after: avoid; }
+  h3 { font-size: 10.5pt; margin: 4mm 0 1.5mm 0; color: #23413a; page-break-after: avoid; }
+  p { margin: 0 0 2.5mm 0; }
+  .subtitle { color: #5a6e66; font-size: 10pt; margin-bottom: 5mm; }
+  .badge { display: inline-block; background: #0F6B44; color: #fff; font-size: 8pt; padding: 1pt 3mm; border-radius: 2mm; vertical-align: middle; }
+  code, .mono { font-family: 'DejaVu Sans Mono', monospace; font-size: 8.3pt; background: #f0f4f2; padding: 0.5pt 1.5pt; border-radius: 1mm; }
+  pre { font-family: 'DejaVu Sans Mono', monospace; font-size: 7.6pt; line-height: 1.35; background: #f4f7f5; border: 0.5pt solid #d8e2dc; border-left: 2.5pt solid #2BB37E; padding: 3mm 4mm; border-radius: 1.5mm; white-space: pre; page-break-inside: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 2mm 0 4mm 0; font-size: 8.6pt; }
+  th { background: #0F6B44; color: #fff; text-align: left; padding: 1.6mm 2.5mm; font-size: 8.4pt; }
+  td { border: 0.5pt solid #ccd8d2; padding: 1.6mm 2.5mm; vertical-align: top; }
+  tr:nth-child(even) td { background: #f6f9f7; }
+  .k { white-space: nowrap; font-weight: bold; color: #23413a; }
+  .ok { color: #0F6B44; font-weight: bold; }
+  .warn { color: #8a6d1a; font-weight: bold; }
+  .flowbox { border: 0.5pt solid #ccd8d2; border-radius: 2mm; padding: 3mm 4mm; background: #fbfdfc; page-break-inside: avoid; }
+  .layer { border-left: 3pt solid #2BB37E; padding-left: 3mm; margin-bottom: 2.5mm; page-break-inside: avoid; }
+  .small { font-size: 8pt; color: #5a6e66; }
+  ul { margin: 1mm 0 2.5mm 4mm; padding: 0; }
+  li { margin-bottom: 1mm; }
+  .pagebreak { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<h1>Clearify — Analysis Pipeline</h1>
+<p class="subtitle">Grounding, anti-hallucination, and failure handling of the news-analysis flow · <span class="badge">v1.0.0</span> &nbsp; 2026-10-18 · verified against source</p>
+
+<p>Clearify analyzes the news article in the active tab, grounds the analysis in <strong>live, keyless web search</strong>, and renders bias dimensions, framing, omissions, and three perspective cards (progressive / mainstream / conservative) in a side panel. Every perspective must cite a source that was <em>literally gathered by the search layer</em> — citations the model invents are stripped in code before the result is ever displayed.</p>
+
+<div class="flowbox">
+<pre>  USER TAB (news article page)
+        │
+        │  EXTRACT_CONTENT → { contentType:'article', text, metadata{title, url, source, lang} }
+        ▼
+  content/content-script.js
+  selector-ladder text extraction + og:* metadata          (12s timeout)
+        │
+        ▼
+  background/service-worker.js   one AbortController per run
+        │
+        │   1   settings + provider key check        (missing key → error state)
+        │   2   keyless coverage search             (15s timeout)
+        │         Google News RSS, regional edition → DuckDuckGo HTML fallback
+        │   3   build analysis prompt               grounded / ungrounded variant
+        │   4   callProvider → analysis LLM         openrouter / nvidia / gemini
+        │   5   parseResponse                       fence strip + balanced-brace JSON
+        │   6   validatePerspectiveCitations        unlisted perspective URLs → 'N/A'
+        │   7   cache + _meta{webEnriched}          memory + session store
+        │
+        │   ANALYSIS_STEP broadcast at every stage boundary
+        ▼
+  sidepanel/sidepanel.js
+  score + dimensions + framing + omissions + perspective cards
+  grounding badge:  🔍 WEB (grounded)   |   ⚠ NO SOURCES (ungrounded run)</pre>
+</div>
+
+<h2>1. Stage-by-stage flow</h2>
+<table>
+<tr><th style="width:22%">Stage</th><th style="width:44%">What happens</th><th>On failure</th></tr>
+<tr><td class="k">Extract</td><td>Content script pulls article text (selector ladder: <code>article</code> → <code>[role=article]</code> → common body classes → all <code><p></code>), plus og:* metadata and the page's BCP-47 <code>lang</code> tag. 12s timeout.</td><td>No text / <50 chars → error: "Make sure you are on a news article."</td></tr>
+<tr><td class="k">Settings + key</td><td><code>getSettings()</code> validates provider + model against the registry; the provider key must exist.</td><td>Missing key → error: "Click the gear icon to enter your key."</td></tr>
+<tr><td class="k">Grounding search</td><td>Keyless coverage search (§2), 15s timeout, run on <em>every</em> analysis. Result: up to 6 real articles with URLs, or nothing.</td><td>Any failure → ungrounded analysis; the panel shows the <span class="warn">⚠ NO SOURCES</span> badge (§4).</td></tr>
+<tr><td class="k">Truncate + prompt</td><td>Article capped at 12,000 chars, cut at a paragraph boundary. Prompt variant chosen by grounding outcome (§3).</td><td>—</td></tr>
+<tr><td class="k">LLM call</td><td><code>callProvider</code> → OpenRouter / NVIDIA / Gemini with per-provider headers and JSON-mode negotiation (OpenRouter falls back silently if a model rejects <code>response_format</code>). Network guards in §5.</td><td>429/503 → one retry (Retry-After honored); timeouts/aborts mapped by the panel to friendly errors.</td></tr>
+<tr><td class="k">Parse</td><td><code>parseResponse</code>: strips code fences, then a string-aware balanced-brace scan picks the first complete JSON object — braces inside string literals and trailing junk objects cannot break it.</td><td>Unparseable → "Could not parse AI response as JSON" error state.</td></tr>
+<tr><td class="k">Citation check</td><td><code>validatePerspectiveCitations</code> (§4, layer 3): perspective URLs and outlet names not literally in the gathered coverage are blanked to <code>N/A</code> before caching.</td><td>—</td></tr>
+<tr><td class="k">Cache + render</td><td><code>_meta {contentType:'article', title, url, source, webEnriched, analyzedAt}</code> attached; result cached in memory + <code>storage.session</code> (<code>storage.local</code> fallback on engines without the API). Stale results (URL ≠ active tab) are refused on panel reopen. Badge: <span class="ok">🔍 WEB</span> when grounded.</td><td>Worker death mid-run → panel gets port-closed error → "Analysis interrupted. Please try again."</td></tr>
+</table>
+
+<h3>Cancellation & lifecycle</h3>
+<ul>
+<li>One <code>AbortController</code> per run; <code>CANCEL_ANALYSIS</code> aborts it. Every fetch is wired to the same signal — user aborts surface as <code>{cancelled}</code> and restore the previous panel state, never as an error.</li>
+<li>MV3 module state resets on worker restart — by design: a dead run cannot resume, the pending panel message surfaces as "Analysis interrupted", <code>lastResult</code> rehydrates from storage, and a fresh run is never fenced off by a stale <code>isAnalyzing</code> flag.</li>
+<li>All <code>chrome.runtime</code>/<code>chrome.tabs</code> messages verify <code>sender.id === chrome.runtime.id</code>; content scripts are low-trust and passive.</li>
+</ul>
+
+<h2>2. The grounding layer — keyless search</h2>
+<p><code>utils/search.js</code>. Two free engines, no API keys, no accounts. Query = the story headline; when a page has no usable headline (paywall, SPA shell) it falls back to the first 14 words of article text. The outlet name is deliberately excluded from the query — searching for it would bias results toward the page the user is already reading, the opposite of what the perspective cards need.</p>
+
+<table>
+<tr><th style="width:24%">Source</th><th style="width:42%">Behavior</th><th>Known failure mode → handling</th></tr>
+<tr><td class="k">Google News RSS <span class="small">(primary)</span></td><td><code>news.google.com/rss/search?q=…&hl&gl&ceid</code>. Aggregates one story across many outlets — exactly the multi-outlet coverage the perspective cards need. Each item yields: headline (outlet suffix split off), a working news.google.com redirect URL, the outlet's own homepage URL, and a date. The page's <code>lang</code> tag maps to a regional edition (<code>en-NG</code> → <code>hl=en&gl=NG&ceid=NG:en</code>), so a Nigerian story surfaces Nigerian outlets; malformed tags fall back to the US edition.</td><td>302 normalization stays on the same host (covered by the manifest permission); unsupported edition params degrade to fallback, then to an ungrounded run.</td></tr>
+<tr><td class="k">DuckDuckGo HTML <span class="small">(fallback)</span></td><td><code>html.duckduckgo.com/html/?q=…</code> — general web results, redirect links (<code>?uddg=</code>) unwrapped to real article URLs, HTML entities decoded.</td><td>Bot challenge answers with <strong>HTTP 202</strong> — <code>ok</code> is true for 202, so it is recognized <em>by status</em>; the anomaly page is never mistaken for a result set. (This silent-failure mode is what originally caused the pipeline to hallucinate perspectives.)</td></tr>
+</table>
+
+<p>Zero results from both engines → the analysis still runs, but ungrounded: the prompt switches to its ungrounded variant, <code>webEnriched:false</code> is stored, and the panel badges the result <span class="warn">⚠ NO SOURCES</span>. Search failure is never silent in the UI again.</p>
+
+<h2>3. The two prompt variants</h2>
+<div class="layer"><strong>Grounded</strong> (coverage found) — the prompt embeds the numbered coverage entries with their exact URLs and contracts: judge omissions only against facts evident in the entries; every perspective's <code>url</code> must be copied <em>character for character</em> from a listed entry; no fitting source → <code>'N/A'</code> for both source and URL.</div>
+<div class="layer"><strong>Ungrounded</strong> (no coverage) — the prompt states that no live coverage was retrieved, forbids inventing outlets, URLs, headlines, or coverage claims, requires <code>'N/A'</code> attribution, restricts omissions to gaps evident from the article text itself, and requires perspective summaries to read as general background context — never as how specific other outlets reported the story.</div>
+<p class="small">The response shape is identical in both variants: credibility score 0–100, four bias dimensions, framing, omissions[], and the three perspective cards (source / url / summary each).</p>
+
+<h2>4. The anti-hallucination stack</h2>
+<table>
+<tr><th style="width:8%">Layer</th><th style="width:26%">Mechanism</th><th>What it prevents</th></tr>
+<tr><td class="k">1</td><td class="k">Keyless live search (GNews RSS → DDG fallback)</td><td>Perspectives written purely from model priors: the model sees real, current, multi-outlet coverage of the same story — no provider key or search tool required.</td></tr>
+<tr><td class="k">2</td><td class="k">Prompt contracts (§3)</td><td>Unforced invention: exact-URL copying in the grounded case; explicit no-invention and <code>N/A</code> rules in the ungrounded case.</td></tr>
+<tr><td class="k">3</td><td class="k">Code-side citation validation</td><td>Model drift: <code>validatePerspectiveCitations</code> blanks any perspective URL not literally among the gathered article/outlet URLs, and blanks outlet names that match no gathered source (a kept exact URL vouches for its card). Enforced after parsing, before caching — prompt obedience is not trusted.</td></tr>
+<tr><td class="k">4</td><td class="k">Honest UI</td><td>Indistinguishable fabrication: <span class="ok">🔍 WEB</span> vs <span class="warn">⚠ NO SOURCES</span> badge tells the user whether perspectives carry live sources; only http(s) URLs render as links; the link label is the real hostname; empty cards dim to 0.35 opacity instead of inventing content.</td></tr>
+</table>
+
+<h2>5. Network guards — <code>fetchWithGuards</code></h2>
+<ul>
+<li><strong>Timeout:</strong> 60s for provider calls, 15s for search. Timeout throws a friendly "pick a faster model" message, distinct from cancellation.</li>
+<li><strong>429/503:</strong> exactly one retry; the server's <code>Retry-After</code> hint is honored, capped at 8s so a hostile header can never stall a run.</li>
+<li><strong>Transient network errors</strong> (ECONNRESET, ETIMEDOUT, "fetch failed"): one retry before surfacing — persistent failures still fail fast.</li>
+<li><strong>User aborts:</strong> propagate as <code>AbortError</code>, mapped to <code>{cancelled}</code>, never reported as failure.</li>
+</ul>
+
+<h2>6. Settings, providers, storage</h2>
+<table>
+<tr><th style="width:22%">Item</th><th>Detail</th></tr>
+<tr><td class="k">Providers</td><td>OpenRouter (OAuth PKCE sign-in via <code>chrome.identity</code>, or pasted key), NVIDIA NIM (pasted key), Google Gemini (pasted key — used only as the analysis LLM; grounding never depends on any provider's key or search tool). Unknown stored providers fall back to OpenRouter; stored models are validated against the registry on read.</td></tr>
+<tr><td class="k">Host permissions</td><td><span class="mono">openrouter.ai · generativelanguage.googleapis.com · integrate.api.nvidia.com · news.google.com · html.duckduckgo.com</span></td></tr>
+<tr><td class="k">storage.local</td><td><span class="mono">providerId, providerModel, apiKeys{openrouter?,nvidia?,gemini?}</span></td></tr>
+<tr><td class="k">storage.session</td><td><span class="mono">lastResult{…,_meta{webEnriched}}</span> (storage.local fallback where the API is absent); OpenRouter PKCE verifier/state (live during sign-in only); Opera pin-hint dismissal.</td></tr>
+</table>
+
+<h2>7. Failure-mode matrix</h2>
+<table>
+<tr><th style="width:30%">Failure</th><th style="width:38%">Behavior</th><th>Where</th></tr>
+<tr><td class="k">DDG bot challenge (HTTP 202)</td><td class="ok">Detected by status; treated as zero results; Google News is primary anyway.</td><td><code>search.js</code></td></tr>
+<tr><td class="k">Google News down / edition rejected</td><td class="ok">Falls back to DDG; both empty → ungrounded run, badged ⚠ NO SOURCES.</td><td><code>search.js</code></td></tr>
+<tr><td class="k">Model invents a perspective URL</td><td class="ok">Blanked to N/A before caching; no fabricated clickable link can render.</td><td><code>api.js</code> validator</td></tr>
+<tr><td class="k">Model wraps JSON in prose / emits junk</td><td class="ok">Balanced-brace scan extracts the first complete object; braces in strings are safe.</td><td><code>parseResponse</code></td></tr>
+<tr><td class="k">Free-model 429 / network blip</td><td class="ok">One guarded retry (Retry-After honored, ≤8s); panel maps leftovers to friendly copy.</td><td><code>fetchWithGuards</code></td></tr>
+<tr><td class="k">Worker killed mid-run</td><td class="ok">Panel: "Analysis interrupted. Please try again."; storage rehydrates lastResult; new runs unblocked.</td><td>SW lifecycle</td></tr>
+<tr><td class="k">Stale result on another page</td><td class="ok">Refused on panel reopen (URL mismatch) — worse-than-nothing results are not shown.</td><td><code>GET_LAST_RESULT</code></td></tr>
+<tr><td class="k">No headline to search with</td><td class="ok">Query falls back to the article's opening words.</td><td><code>buildSearchQuery</code></td></tr>
+</table>
+
+<h2>8. File map & test coverage</h2>
+<table>
+<tr><th style="width:26%">File</th><th>Role</th></tr>
+<tr><td class="k mono">background/service-worker.js</td><td>Orchestrator: settings, per-run AbortController, search wiring, citation validation, caching, OpenRouter OAuth, per-engine panel opening.</td></tr>
+<tr><td class="k mono">content/content-script.js</td><td>Passive reader: selector-ladder text extraction, og:* metadata, page lang. Never writes to the page.</td></tr>
+<tr><td class="k mono">utils/search.js</td><td>Keyless grounding: GNews RSS parser + edition mapping, DDG parser + 202 detection, query building, coverage formatting.</td></tr>
+<tr><td class="k mono">utils/api.js</td><td>Provider registry + dispatch, fetch guards, prompt variants, JSON extraction, citation validator. Pure, unit-tested.</td></tr>
+<tr><td class="k mono">sidepanel/sidepanel.js</td><td>State machine, settings form, sign-in status, grounding badge, friendly error mapping.</td></tr>
+<tr><td class="k mono">test/*.test.js</td><td>api (prompt variants, JSON extraction, citation validation) · search (both parsers, edition params, fallback ordering with mocked fetch, query building) · guards (retries, Retry-After cap, timeouts, abort semantics) · oauth (PKCE primitives). All green at build time.</td></tr>
+</table>
+
+<p class="small">Distributions are rebuilt from these sources into five per-browser builds (chromium, arc, firefox, opera, safari) by <code>scripts/build.js</code>; each build folder is a complete, loadable extension.</p>
+
+</body>
+</html>
